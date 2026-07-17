@@ -1,0 +1,270 @@
+name: Build EasyTier FFI Libraries
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "EasyTier git ref to build, for example: main, develop, v2.6.4, or a commit SHA"
+        required: true
+        default: "main"
+      create_release:
+        description: "Publish artifacts to a GitHub Release after environment approval"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  EASYTIER_REPO: https://github.com/easytier/easytier.git
+  EASYTIER_DIR: easytier-src
+  RUST_TOOLCHAIN: "1.95"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-ffi:
+    name: ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ffi_lib: easytier_ffi.dll
+
+          - artifact_name: linux-amd64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ffi_lib: libeasytier_ffi.so
+
+          - artifact_name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ffi_lib: libeasytier_ffi.so
+
+          - artifact_name: macos-amd64
+            os: macos-14
+            target: x86_64-apple-darwin
+            ffi_lib: libeasytier_ffi.dylib
+
+          - artifact_name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            ffi_lib: libeasytier_ffi.dylib
+
+    outputs:
+      source_version: ${{ steps.source-info.outputs.source_version }}
+      source_commit: ${{ steps.source-info.outputs.source_commit }}
+      release_tag: ${{ steps.source-info.outputs.release_tag }}
+
+    steps:
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            clang \
+            llvm \
+            lld
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Verify protoc
+        run: |
+          protoc --version
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+
+      - name: Clone EasyTier source
+        run: |
+          git init "$EASYTIER_DIR"
+          cd "$EASYTIER_DIR"
+          git remote add origin "$EASYTIER_REPO"
+          git fetch --depth=1 origin "${{ inputs.source_ref }}"
+          git checkout --detach FETCH_HEAD
+          git rev-parse HEAD
+
+      - name: Read source version
+        id: source-info
+        working-directory: ${{ env.EASYTIER_DIR }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' easytier/Cargo.toml | head -n 1)
+          if [[ -z "$VERSION" ]]; then
+            echo "Failed to read version from easytier/Cargo.toml" >&2
+            exit 1
+          fi
+
+          COMMIT=$(git rev-parse HEAD)
+          TAG="easytier-ffi-v$VERSION"
+
+          echo "source_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "EasyTier version: $VERSION"
+          echo "EasyTier commit: $COMMIT"
+          echo "Release tag: $TAG"
+
+      - name: Build FFI cdylib
+        working-directory: ${{ env.EASYTIER_DIR }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build \
+            --release \
+            --target "$TARGET" \
+            --package easytier-ffi
+
+      - name: Package artifact
+        working-directory: ${{ env.EASYTIER_DIR }}
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          FFI_LIB: ${{ matrix.ffi_lib }}
+          SOURCE_VERSION: ${{ steps.source-info.outputs.source_version }}
+          SOURCE_COMMIT: ${{ steps.source-info.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="../artifacts/easytier-ffi-$ARTIFACT_NAME"
+          BUILD_DIR="target/$TARGET/release"
+
+          mkdir -p "$OUT_DIR"
+          cp "$BUILD_DIR/$FFI_LIB" "$OUT_DIR/"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            shopt -s nullglob
+            WINDOWS_LIB_COUNT=0
+
+            # MSVC cdylib builds produce an import library used by native linkers.
+            for file in \
+              "$BUILD_DIR/easytier_ffi.dll.lib" \
+              "$BUILD_DIR/easytier_ffi.lib" \
+              "$BUILD_DIR/easytier_ffi.exp" \
+              easytier/third_party/x86_64/*.dll \
+              easytier/third_party/x86_64/*.sys
+            do
+              if [[ -f "$file" ]]; then
+                cp "$file" "$OUT_DIR/"
+                if [[ "$file" == *.lib ]]; then
+                  WINDOWS_LIB_COUNT=$((WINDOWS_LIB_COUNT + 1))
+                fi
+              fi
+            done
+
+            if [[ "$WINDOWS_LIB_COUNT" -eq 0 ]]; then
+              echo "Windows import/static export library was not found in $BUILD_DIR" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "EasyTier FFI build"
+            echo "source_repo=$EASYTIER_REPO"
+            echo "source_ref=${{ inputs.source_ref }}"
+            echo "source_version=$SOURCE_VERSION"
+            echo "source_commit=$SOURCE_COMMIT"
+            echo "target=$TARGET"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "protoc=$(protoc --version)"
+          } > "$OUT_DIR/BUILD_INFO.txt"
+
+          cd ../artifacts
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            7z a "easytier-ffi-$ARTIFACT_NAME.zip" "easytier-ffi-$ARTIFACT_NAME"
+          else
+            tar -czf "easytier-ffi-$ARTIFACT_NAME.tar.gz" "easytier-ffi-$ARTIFACT_NAME"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: easytier-ffi-${{ matrix.artifact_name }}
+          path: |
+            artifacts/easytier-ffi-${{ matrix.artifact_name }}.zip
+            artifacts/easytier-ffi-${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-24.04
+    needs: build-ffi
+    if: ${{ inputs.create_release }}
+    environment:
+      name: easytier-ffi-release
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          find release-assets -maxdepth 1 -type f -print | sort
+
+      - name: Wait for release approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ github.actor }}
+          minimum-approvals: 1
+          issue-title: Approve EasyTier FFI v${{ needs.build-ffi.outputs.source_version }} release
+          issue-body: |
+            The EasyTier FFI artifacts have been built and are ready to publish.
+
+            Reply to this issue with `approved`, `approve`, `lgtm`, or `yes` to publish the Release.
+            Reply with `denied`, `deny`, or `no` to stop the workflow.
+
+            Source ref: `${{ inputs.source_ref }}`
+            Source version: `${{ needs.build-ffi.outputs.source_version }}`
+            Source commit: `${{ needs.build-ffi.outputs.source_commit }}`
+            Release tag: `${{ needs.build-ffi.outputs.release_tag }}`
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-ffi.outputs.release_tag }}
+          name: EasyTier FFI v${{ needs.build-ffi.outputs.source_version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: |
+            EasyTier FFI libraries built from https://github.com/easytier/easytier.
+
+            Source ref: `${{ inputs.source_ref }}`
+            Source version: `${{ needs.build-ffi.outputs.source_version }}`
+            Source commit: `${{ needs.build-ffi.outputs.source_commit }}`
+
+            Included targets:
+            - Windows amd64: `x86_64-pc-windows-msvc`
+            - Linux amd64: `x86_64-unknown-linux-gnu`
+            - Linux aarch64: `aarch64-unknown-linux-gnu`
+            - macOS amd64: `x86_64-apple-darwin`
+            - macOS aarch64: `aarch64-apple-darwin`
+          files: release-assets/*
