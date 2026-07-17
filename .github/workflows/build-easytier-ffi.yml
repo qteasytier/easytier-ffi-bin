@@ -76,7 +76,8 @@ jobs:
             pkg-config \
             clang \
             llvm \
-            lld
+            lld \
+            mold
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
