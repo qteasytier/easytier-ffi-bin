@@ -139,7 +139,7 @@ jobs:
             --target "$TARGET" \
             --package easytier-ffi
 
-      - name: Package artifact
+      - name: Collect artifact files
         working-directory: ${{ env.EASYTIER_DIR }}
         env:
           TARGET: ${{ matrix.target }}
@@ -194,20 +194,11 @@ jobs:
             echo "protoc=$(protoc --version)"
           } > "$OUT_DIR/BUILD_INFO.txt"
 
-          cd ../artifacts
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            7z a "easytier-ffi-$ARTIFACT_NAME.zip" "easytier-ffi-$ARTIFACT_NAME"
-          else
-            tar -czf "easytier-ffi-$ARTIFACT_NAME.tar.gz" "easytier-ffi-$ARTIFACT_NAME"
-          fi
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: easytier-ffi-${{ matrix.artifact_name }}
-          path: |
-            artifacts/easytier-ffi-${{ matrix.artifact_name }}.zip
-            artifacts/easytier-ffi-${{ matrix.artifact_name }}.tar.gz
+          path: artifacts/easytier-ffi-${{ matrix.artifact_name }}
           if-no-files-found: error
 
   publish-release:
